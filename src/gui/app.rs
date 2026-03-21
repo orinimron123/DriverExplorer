@@ -3,10 +3,13 @@ use super::ui;
 use crate::drivers;
 use crate::export::{ExportFormat, ExportOptions};
 use crate::services;
+// use std::io::Cursor;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
+use tiny_http::{Header, Response, Server};
 
 pub struct DriverExplorerApp {
     state: AppState,
@@ -81,7 +84,9 @@ impl DriverExplorerApp {
 
     /// Resolve driver filename to SCM service name
     fn resolve_service_name(&self, driver_filename: &str) -> Option<String> {
-        self.state.drivers.iter()
+        self.state
+            .drivers
+            .iter()
             .find(|d| d.name == driver_filename)
             .and_then(|d| d.service_name.clone())
     }
@@ -100,10 +105,8 @@ impl DriverExplorerApp {
         };
         match services::start_driver(&svc_name) {
             Ok(()) => {
-                self.state.set_status(
-                    format!("Driver '{}' started", name),
-                    StatusKind::Success,
-                );
+                self.state
+                    .set_status(format!("Driver '{}' started", name), StatusKind::Success);
                 self.start_loading();
             }
             Err(e) => {
@@ -129,10 +132,8 @@ impl DriverExplorerApp {
         };
         match services::stop_driver(&svc_name) {
             Ok(()) => {
-                self.state.set_status(
-                    format!("Driver '{}' stopped", name),
-                    StatusKind::Success,
-                );
+                self.state
+                    .set_status(format!("Driver '{}' stopped", name), StatusKind::Success);
                 self.start_loading();
             }
             Err(e) => {
@@ -151,10 +152,8 @@ impl DriverExplorerApp {
             let svc_name = driver.service_name.as_deref().unwrap_or(name);
             match services::register_driver(svc_name, svc_name, &path) {
                 Ok(()) => {
-                    self.state.set_status(
-                        format!("Driver '{}' registered", name),
-                        StatusKind::Success,
-                    );
+                    self.state
+                        .set_status(format!("Driver '{}' registered", name), StatusKind::Success);
                 }
                 Err(e) => {
                     self.state.set_status(
@@ -228,7 +227,10 @@ impl DriverExplorerApp {
     fn handle_dm_register(&mut self) {
         let dm = &self.state.driver_manager;
         if dm.service_name.is_empty() || dm.driver_path.is_empty() {
-            self.dm_log("Service name and driver path are required", StatusKind::Error);
+            self.dm_log(
+                "Service name and driver path are required",
+                StatusKind::Error,
+            );
             return;
         }
         let name = dm.service_name.clone();
@@ -256,10 +258,16 @@ impl DriverExplorerApp {
         }
         match services::start_driver(&name) {
             Ok(()) => {
-                self.dm_log(&format!("Started '{}' successfully", name), StatusKind::Success);
+                self.dm_log(
+                    &format!("Started '{}' successfully", name),
+                    StatusKind::Success,
+                );
                 self.state.driver_manager.service_status = Some("Running".to_string());
             }
-            Err(e) => self.dm_log(&format!("Start '{}' failed: {}", name, e), StatusKind::Error),
+            Err(e) => self.dm_log(
+                &format!("Start '{}' failed: {}", name, e),
+                StatusKind::Error,
+            ),
         }
     }
 
@@ -271,7 +279,10 @@ impl DriverExplorerApp {
         }
         match services::stop_driver(&name) {
             Ok(()) => {
-                self.dm_log(&format!("Stopped '{}' successfully", name), StatusKind::Success);
+                self.dm_log(
+                    &format!("Stopped '{}' successfully", name),
+                    StatusKind::Success,
+                );
                 self.state.driver_manager.service_status = Some("Stopped".to_string());
             }
             Err(e) => self.dm_log(&format!("Stop '{}' failed: {}", name, e), StatusKind::Error),
@@ -286,7 +297,10 @@ impl DriverExplorerApp {
         }
         match services::unregister_driver(&name) {
             Ok(()) => {
-                self.dm_log(&format!("Unregistered '{}' successfully", name), StatusKind::Success);
+                self.dm_log(
+                    &format!("Unregistered '{}' successfully", name),
+                    StatusKind::Success,
+                );
                 self.state.driver_manager.service_status = None;
             }
             Err(e) => self.dm_log(
@@ -308,10 +322,32 @@ impl DriverExplorerApp {
                 self.state.driver_manager.service_status = Some(status);
             }
             Err(e) => {
-                self.dm_log(&format!("Query '{}' failed: {}", name, e), StatusKind::Error);
+                self.dm_log(
+                    &format!("Query '{}' failed: {}", name, e),
+                    StatusKind::Error,
+                );
                 self.state.driver_manager.service_status = None;
             }
         }
+    }
+
+    /// Helper to check if a path resides within a protected Windows directory
+    #[cfg(target_os = "windows")]
+    fn is_secure_directory(exe_path: &Path) -> bool {
+        // Standard secure directories on Windows where standard users cannot write
+        let secure_dirs = [
+            std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string()),
+            std::env::var("ProgramFiles(x86)")
+                .unwrap_or_else(|_| r"C:\Program Files (x86)".to_string()),
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+        ];
+
+        let exe_path_str = exe_path.to_string_lossy().to_uppercase();
+
+        secure_dirs.iter().any(|dir| {
+            let secure_dir_str = dir.to_uppercase();
+            exe_path_str.starts_with(&secure_dir_str)
+        })
     }
 
     /// Handle elevate to admin button click
@@ -332,11 +368,26 @@ impl DriverExplorerApp {
             use windows::core::PCWSTR;
 
             let to_wide = |s: &str| -> Vec<u16> {
-                OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+                OsStr::new(s)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect()
             };
 
             if let Ok(exe) = std::env::current_exe() {
+                // Verify the executable is running from a secure location
+                if !Self::is_secure_directory(&exe) {
+                    log::error!(
+                        "Security violation: Cannot elevate from an insecure directory: {:?}",
+                        exe
+                    );
+
+                    return;
+                }
+
                 if let Some(exe_str) = exe.to_str() {
+                    log::info!("current_exe path: {}", exe_str);
+
                     let verb = to_wide("runas");
                     let file = to_wide(exe_str);
                     let empty = to_wide("");
@@ -372,7 +423,7 @@ impl DriverExplorerApp {
         {
             use windows::Win32::Foundation::CloseHandle;
             use windows::Win32::Security::{
-                GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+                GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
             };
             use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -408,7 +459,8 @@ impl DriverExplorerApp {
         let text = match self.state.format_selected_for_clipboard() {
             Some(t) => t,
             None => {
-                self.state.set_status("No driver selected", StatusKind::Error);
+                self.state
+                    .set_status("No driver selected", StatusKind::Error);
                 return;
             }
         };
@@ -422,16 +474,12 @@ impl DriverExplorerApp {
         if let Some(path) = file {
             match std::fs::write(&path, &text) {
                 Ok(()) => {
-                    self.state.set_status(
-                        format!("Saved to {}", path.display()),
-                        StatusKind::Success,
-                    );
+                    self.state
+                        .set_status(format!("Saved to {}", path.display()), StatusKind::Success);
                 }
                 Err(e) => {
-                    self.state.set_status(
-                        format!("Failed to save: {}", e),
-                        StatusKind::Error,
-                    );
+                    self.state
+                        .set_status(format!("Failed to save: {}", e), StatusKind::Error);
                 }
             }
         }
@@ -445,11 +493,11 @@ impl DriverExplorerApp {
             {
                 use std::ffi::OsStr;
                 use std::os::windows::ffi::OsStrExt;
-                use windows::core::PCWSTR;
                 use windows::Win32::UI::Shell::{
-                    ShellExecuteExW, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW,
+                    SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW,
                 };
                 use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
+                use windows::core::PCWSTR;
 
                 let path_wide: Vec<u16> = OsStr::new(&path)
                     .encode_wide()
@@ -525,12 +573,17 @@ impl DriverExplorerApp {
                 GuiAction::CopySelectedItems => {
                     if let Some(text) = self.state.format_selected_for_clipboard() {
                         ctx.copy_text(text);
-                        self.state.set_status("Copied to clipboard", StatusKind::Success);
+                        self.state
+                            .set_status("Copied to clipboard", StatusKind::Success);
                     }
                 }
                 GuiAction::SelectAll => {
-                    let names: Vec<String> = self.state.filtered_drivers()
-                        .iter().map(|d| d.name.clone()).collect();
+                    let names: Vec<String> = self
+                        .state
+                        .filtered_drivers()
+                        .iter()
+                        .map(|d| d.name.clone())
+                        .collect();
                     for name in names {
                         self.state.selected_names.insert(name);
                     }
@@ -562,7 +615,11 @@ impl DriverExplorerApp {
                 GuiAction::DmUnregister => self.handle_dm_unregister(),
                 GuiAction::DmQuickLoad => {
                     self.handle_dm_register();
-                    if self.state.driver_manager.log.last()
+                    if self
+                        .state
+                        .driver_manager
+                        .log
+                        .last()
                         .map_or(false, |e| matches!(e.kind, StatusKind::Success))
                     {
                         self.handle_dm_start();
@@ -584,7 +641,8 @@ impl DriverExplorerApp {
         let drivers: Vec<_> = if selected_only {
             let sel = self.state.selected_drivers_cloned();
             if sel.is_empty() {
-                self.state.set_status("No drivers selected", StatusKind::Error);
+                self.state
+                    .set_status("No drivers selected", StatusKind::Error);
                 return;
             }
             sel
@@ -624,10 +682,8 @@ impl DriverExplorerApp {
                     );
                 }
                 Err(e) => {
-                    self.state.set_status(
-                        format!("Export failed: {}", e),
-                        StatusKind::Error,
-                    );
+                    self.state
+                        .set_status(format!("Export failed: {}", e), StatusKind::Error);
                 }
             }
         }
@@ -648,7 +704,10 @@ impl DriverExplorerApp {
                 "drivers": self.state.drivers,
             });
 
-            match std::fs::write(&path, serde_json::to_string_pretty(&snapshot).unwrap_or_default()) {
+            match std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
+            ) {
                 Ok(()) => {
                     self.state.set_status(
                         format!("Snapshot saved to {}", path.display()),
@@ -656,13 +715,76 @@ impl DriverExplorerApp {
                     );
                 }
                 Err(e) => {
-                    self.state.set_status(
-                        format!("Failed to save snapshot: {}", e),
-                        StatusKind::Error,
-                    );
+                    self.state
+                        .set_status(format!("Failed to save snapshot: {}", e), StatusKind::Error);
                 }
             }
         }
+    }
+
+    /// Spins up a localhost HTTP server that serves `html` exactly once
+    /// on a random OS-assigned port, then shuts itself down.
+    /// No file ever touches disk — eliminates the temp file attack surface entirely.
+    fn open_html_in_browser(&mut self, html: String) {
+        self.state
+            .set_status("Opening a One-Shot HTTP server", StatusKind::Info);
+
+        let server = match Server::http("127.0.0.1:0") {
+            Ok(s) => s,
+            Err(e) => {
+                self.state.set_status(
+                    format!("Failed to bind local HTTP server: {}", e),
+                    StatusKind::Error,
+                );
+                log::error!("Failed to bind local HTTP server: {}", e);
+                return;
+            }
+        };
+
+        // Retrieve the actual port the OS assigned
+        let port = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
+
+        if port == 0 {
+            self.state
+                .set_status("OS assigned invalid port".to_string(), StatusKind::Error);
+            log::error!("OS assigned invalid port — aborting");
+            return;
+        }
+
+        let url = format!("http://127.0.0.1:{}/", port);
+        log::info!("Serving compare view at {}", url);
+
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("cmd")
+                .raw_arg(format!("/C start \"\" \"{}\"", url))
+                .spawn();
+        }
+
+        // spawn a thread so the UI thread is not blocked.
+        std::thread::spawn(move || {
+            match server.recv() {
+                Ok(request) => {
+                    let content_type =
+                        Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
+
+                    // Serve the hardcoded html variable — no disk I/O at all
+                    let response = Response::from_string(html)
+                        .with_header(content_type)
+                        .with_status_code(200);
+
+                    if let Err(e) = request.respond(response) {
+                        log::error!("Failed to send HTTP response: {}", e);
+                    }
+                }
+                Err(e) => {
+                    log::error!("HTTP server recv error: {}", e);
+                }
+            }
+
+            // Server is dropped here — port is released, no further requests served
+            log::info!("One-shot HTTP server shut down cleanly");
+        });
     }
 
     /// Compare current state against a saved snapshot
@@ -676,10 +798,8 @@ impl DriverExplorerApp {
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(e) => {
-                    self.state.set_status(
-                        format!("Failed to read snapshot: {}", e),
-                        StatusKind::Error,
-                    );
+                    self.state
+                        .set_status(format!("Failed to read snapshot: {}", e), StatusKind::Error);
                     return;
                 }
             };
@@ -687,16 +807,17 @@ impl DriverExplorerApp {
             let baseline: serde_json::Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 Err(e) => {
-                    self.state.set_status(
-                        format!("Invalid snapshot JSON: {}", e),
-                        StatusKind::Error,
-                    );
+                    self.state
+                        .set_status(format!("Invalid snapshot JSON: {}", e), StatusKind::Error);
                     return;
                 }
             };
 
             let baseline_drivers: Vec<crate::drivers::DriverInfo> = match serde_json::from_value(
-                baseline.get("drivers").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+                baseline
+                    .get("drivers")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Array(vec![])),
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -710,15 +831,18 @@ impl DriverExplorerApp {
 
             // Compare
             use std::collections::BTreeSet;
-            let baseline_names: BTreeSet<String> = baseline_drivers.iter().map(|d| d.name.clone()).collect();
-            let current_names: BTreeSet<String> = self.state.drivers.iter().map(|d| d.name.clone()).collect();
+            let baseline_names: BTreeSet<String> =
+                baseline_drivers.iter().map(|d| d.name.clone()).collect();
+            let current_names: BTreeSet<String> =
+                self.state.drivers.iter().map(|d| d.name.clone()).collect();
 
             let added: Vec<_> = current_names.difference(&baseline_names).collect();
             let removed: Vec<_> = baseline_names.difference(&current_names).collect();
             let common = baseline_names.intersection(&current_names).count();
 
             // Build comparison report as HTML and open
-            let mut html = String::from("<!DOCTYPE html><html><head><title>Snapshot Comparison</title>");
+            let mut html =
+                String::from("<!DOCTYPE html><html><head><title>Snapshot Comparison</title>");
             html.push_str("<style>body{font-family:sans-serif;padding:20px;background:#f5f5f5}");
             html.push_str(".container{max-width:900px;margin:0 auto;background:white;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}");
             html.push_str("h1{color:#333}h2{color:#555;margin-top:20px}");
@@ -726,16 +850,29 @@ impl DriverExplorerApp {
             html.push_str("ul{list-style:none;padding:0}li{padding:4px 8px;border-bottom:1px solid #eee}</style>");
             html.push_str("</head><body><div class=\"container\">");
             html.push_str(&format!("<h1>Snapshot Comparison</h1>"));
-            html.push_str(&format!("<p>Baseline: {} ({} drivers)</p>", path.display(), baseline_drivers.len()));
-            html.push_str(&format!("<p>Current: Live system ({} drivers)</p>", self.state.drivers.len()));
+            html.push_str(&format!(
+                "<p>Baseline: {} ({} drivers)</p>",
+                path.display(),
+                baseline_drivers.len()
+            ));
+            html.push_str(&format!(
+                "<p>Current: Live system ({} drivers)</p>",
+                self.state.drivers.len()
+            ));
 
-            html.push_str(&format!("<h2 class=\"added\">Added ({}):</h2><ul>", added.len()));
+            html.push_str(&format!(
+                "<h2 class=\"added\">Added ({}):</h2><ul>",
+                added.len()
+            ));
             for name in &added {
                 html.push_str(&format!("<li>+ {}</li>", name));
             }
             html.push_str("</ul>");
 
-            html.push_str(&format!("<h2 class=\"removed\">Removed ({}):</h2><ul>", removed.len()));
+            html.push_str(&format!(
+                "<h2 class=\"removed\">Removed ({}):</h2><ul>",
+                removed.len()
+            ));
             for name in &removed {
                 html.push_str(&format!("<li>- {}</li>", name));
             }
@@ -744,18 +881,15 @@ impl DriverExplorerApp {
             html.push_str(&format!("<p class=\"unchanged\">Unchanged: {}</p>", common));
             html.push_str("</div></body></html>");
 
-            let temp = std::env::temp_dir().join("driverexplorer_compare.html");
-            if let Ok(()) = std::fs::write(&temp, &html) {
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("cmd")
-                        .raw_arg(format!("/C start \"\" \"{}\"", temp.to_str().unwrap_or("")))
-                        .spawn();
-                }
-            }
+            self.open_html_in_browser(html);
 
             self.state.set_status(
-                format!("Compared: +{} added, -{} removed, {} unchanged", added.len(), removed.len(), common),
+                format!(
+                    "Compared: +{} added, -{} removed, {} unchanged",
+                    added.len(),
+                    removed.len(),
+                    common
+                ),
                 StatusKind::Success,
             );
         }
@@ -772,7 +906,11 @@ impl DriverExplorerApp {
                     let signer_text = signer.as_deref().unwrap_or("N/A");
                     self.state.set_status(
                         format!("{}: {} (Signer: {})", name, status_text, signer_text),
-                        if is_signed { StatusKind::Success } else { StatusKind::Info },
+                        if is_signed {
+                            StatusKind::Success
+                        } else {
+                            StatusKind::Info
+                        },
                     );
                 }
                 Err(e) => {
@@ -783,10 +921,10 @@ impl DriverExplorerApp {
                 }
             }
         } else {
-            self.state.set_status("No driver selected", StatusKind::Error);
+            self.state
+                .set_status("No driver selected", StatusKind::Error);
         }
     }
-
 }
 
 impl eframe::App for DriverExplorerApp {
